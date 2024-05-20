@@ -1,0 +1,791 @@
+/* ********************************************************************************* */
+/* ************************* FACTSET INSTITUTIONAL OWNERSHIP *********************** */
+/* ********************************************************************************* */
+/* Summary   : This application provides institutional data at a firm level          */
+/* Date      : July, 2020	                                                     */
+/* Authors   : Miguel Ferreira, Pedro Matos, and Pedro Pires                         */
+/* Details   : -International coverage                                               */
+/*             -Great detail in terms of origin (domestic / foreign),                */
+/*		and a few concentration measures (herfindhal, top5..)                */
+/*                                                  	                             */
+/* ********************************************************************************* */
+
+
+* ************************************* ;
+* User Defined Variables				;
+* ************************************* ;
+* starting quarter (YYYY0Q);
+%let sqtr = 200001;
+
+* ending quarter (YYYY0Q);
+%let eqtr = 201904;
+
+* roll forward missing reports (0/1);
+%let roll = 1;
+
+*roll 1 - takes a snapshot of the entity's last available report to fill missing reports 
+in between two report dates. Each report is valid for 7 quarters;
+%let n1 = 7;
+
+*roll 2 - fills missing reports if the most recent report was filed on or after T-3;
+%let n2 = 3;
+
+* db updates (0/1)
+* Updates to Factset mktcap data (0/1);
+%let bd_upd = 0;
+* ************************************* ;
+
+%include '/home/uva/piresp/fstables_2020.sas';
+
+* Defines WRDS (SAS) Libraries;
+libname common "/wrds/factset/sasdata/common";
+libname ff_usc "/wrds/factset/sasdata/ff_usc_v3";
+libname ff_int "/wrds/factset/sasdata/ff_int_v3";
+libname own "/wrds/factset/sasdata/own_v5";
+libname piresp "/home/uva/piresp/";
+
+* proxy for termination date from security prices table;
+proc sql;
+create table termination as
+select fsym_ID, max(price_date) format=YYMMDD10. as termination_date
+from own.own_sec_prices_eq
+group by fsym_ID;
+
+* securities that are defined as Equity or ADR in ownership, or Preferred if defined as PREFEQ in sym_coverage;
+proc sql;
+create table equity_secs as
+select a.fsym_id, a.issue_type, a.iso_country, b.fref_security_type
+from own.own_sec_coverage_eq a left join common.sym_coverage b
+on a.fsym_id eq b.fsym_id
+where a.fsym_id in (select distinct fsym_id from own.own_sec_prices_eq) 
+and(a.issue_type in ('EQ','AD') or (issue_type eq 'PF' and b.fref_security_type eq 'PREFEQ'));
+
+proc sql;
+create table own_basic as
+select a.*, b.factset_entity_id, c.termination_date
+from equity_secs a, own.own_sec_entity_eq b, termination c
+where a.fsym_id eq b.fsym_id and a.fsym_id eq c.fsym_id;
+
+* updates unadj_own_basic with main company for dual listed entities to combine; 
+proc sql;
+update own_basic as a
+	set factset_entity_id = (
+		select b.factset_entity_id from dlc b
+		where a.factset_entity_id eq b.dlc_entity_id)
+	where  exists (select 1 from dlc b where a.factset_entity_id eq b.dlc_entity_id);
+
+* ..................................................................... ;
+* most recent price_date within each month								;
+* ..................................................................... ;
+proc sql;
+create table prices_historical as
+select 	 a.fsym_ID, 
+		 year(a.price_date)*100+month(a.price_date) as month,
+		 year(a.price_date)*100+qtr(a.price_date) as quarter,
+		 a.adj_shares_outstanding,
+		 a.adj_price,
+		 a.adj_price*a.adj_shares_outstanding/1000000 as own_mktcap
+from	 own.own_sec_prices_eq a, 
+		 (select fsym_ID, year(price_date)*100+month(price_date) as month, max(price_date) as maxdate
+			from own.own_sec_prices_eq
+			group by fsym_ID, calculated month) b
+where	 (a.fsym_ID = b.fsym_ID and a.price_date = b.maxdate)
+order by a.fsym_ID, calculated month;
+* ......................................................................................;
+
+* ......................................................................................;
+* Market Cap Procedure; 
+* ......................................................................................;
+
+* Proxy for company-level Mktcap from OWNERSHIP;
+proc sql;
+create table own_mktcap1 as
+select a.*, b.factset_entity_id, b.issue_type, b.fref_security_type, a.adj_price * a.adj_shares_outstanding as own_mv
+from own.own_sec_prices_eq a, own_basic b
+where a.fsym_ID eq b.fsym_ID
+and b.issue_type ne 'AD';
+
+* unilever;
+proc sql;
+delete from own_mktcap1 where fsym_id eq 'DXVFL5-S' and price_date ge '30SEP2015'd;
+
+proc sql;
+create table own_mktcap as
+select factset_entity_id, price_date, sum(own_mv) as own_mv
+from own_mktcap1
+group by factset_entity_id, price_date;
+
+proc sql;
+create table hmktcap as
+select  factset_entity_id, 
+		year(price_date)*100+month(price_date) as month,
+		year(price_date)*100+qtr(price_date) as quarter,
+		case
+		  when month(price_date) in (3,6,9,12) then 1
+		  else 0
+		end as eoq,  
+		own_mv/1000000 as mktcap_usd
+from own_mktcap
+where factset_entity_id is not missing
+and calculated mktcap_usd is not missing and calculated mktcap_usd gt 0;
+
+proc sort data=hmktcap nodupkeys; by factset_entity_id month; run;
+
+* optional macro: use market cap from fundamentals for Chinese stocks;
+%macro bdup (flag);
+	%if &flag=1 %then %do;
+
+	proc sql;
+	create table mkt_cap_monthly1 as
+	select * 
+	from (
+		select fsym_id, factset_entity_id, iso_currency, price_date, ff_shs_out, price_m
+		from ff_usc.monthly_prices_final_usc_v3
+		union all
+		select fsym_id,factset_entity_id, iso_currency, price_date, ff_shs_out, price_m
+		from ff_int.monthly_prices_final_int_v3 where iso_currency is not missing
+	  )
+	where fsym_id in (select distinct fsym_id from common.sym_coverage where fref_security_type in ('SHARE','ADR','DR','GDR','NVDR','PREFEQ'))
+	and fsym_id is not missing and factset_entity_id is not missing;
+
+	proc sql;
+	update mkt_cap_monthly1
+	set price_m = . where price_m is not missing and price_m lt 0;
+
+	proc sql;
+	create table count_init as
+	select distinct factset_entity_id
+	from mkt_cap_monthly1;
+
+	proc sql;
+	create table pairs1 as
+	select distinct fsym_id, factset_entity_id
+	from mkt_cap_monthly1;
+
+	proc sql;
+	create table count1 as
+	select factset_entity_id, count(*) as nobs
+	from pairs1
+	group by factset_entity_id
+	having count(*) eq 1;
+
+	proc sql;
+	create table pairs2 as
+	select fsym_id, factset_entity_id
+	from pairs1
+	where factset_entity_id not in (select factset_entity_id from count1)
+	and (fsym_id in (select distinct fsym_primary_listing_id from common.sym_coverage where fsym_id eq fsym_primary_equity_id)
+	or fsym_id in (select distinct fsym_primary_equity_id from common.sym_coverage where fsym_id eq fsym_primary_equity_id));
+
+	proc sql;
+	create table count2 as
+	select factset_entity_id, count(*) as nobs
+	from pairs2
+	group by factset_entity_id
+	having count(*) eq 1;
+
+	proc sql;
+	create table count3 as
+	select factset_entity_id, count(*) as nobs
+	from pairs2
+	group by factset_entity_id
+	having count(*) ne 1;
+
+	proc sql;
+	create table pairs3 as
+	select fsym_id, factset_entity_id
+	from pairs1
+	where factset_entity_id not in (select factset_entity_id from count1)
+	and factset_entity_id not in (select factset_entity_id from count2)
+	and factset_entity_id not in (select factset_entity_id from count3);
+
+	proc sql; create table count_miss as select distinct factset_entity_id from pairs3;
+
+	proc sql;
+	create table mkt_cap_monthly2 as
+	select *
+	from mkt_cap_monthly1
+	where fsym_id in (select fsym_id from pairs1 where factset_entity_id in (select factset_entity_id from count1))
+	or fsym_id in (select fsym_id from pairs2 where factset_entity_id in (select factset_entity_id from count2))
+	or fsym_id in (select fsym_id from pairs2 where factset_entity_id in (select factset_entity_id from count3))
+	or fsym_id in (select fsym_id from pairs3);
+
+	proc sql;
+	create table count_final as
+	select distinct factset_entity_id
+	from mkt_cap_monthly2;
+
+	proc sql;
+	create table mkt_cap as
+	select a.fsym_id, a.factset_entity_id, a.price_date, 
+		   case
+		   	 when a.iso_currency eq 'USD' then 1
+			 else b.exch_rate_usd
+		   end as exch_rate_usd,
+		   a.ff_shs_out*a.price_m*calculated exch_rate_usd as mktcap_usd
+	from mkt_cap_monthly2 a
+	left join common.fx_rates_usd b
+				on (a.iso_currency eq b.iso_currency and a.price_date eq b.date)
+	where calculated mktcap_usd is not missing
+	order by a.factset_entity_id, a.price_date;
+
+	proc sql;
+	create table hmktcap_funda as
+	select  factset_entity_id, 
+			year(price_date)*100+month(price_date) as month,
+			year(price_date)*100+qtr(price_date) as quarter,
+			case
+			  when month(price_date) in (3,6,9,12) then 1
+			  else 0
+			end as eoq,  
+			max(mktcap_usd) as mktcap_usd
+	from mkt_cap
+	where factset_entity_id is not missing
+	group by factset_entity_id, calculated month, calculated quarter, calculated eoq;
+
+	proc sort data=hmktcap_funda nodupkeys; by factset_entity_id month; run;
+
+	* Use market cap from fundamentals for Chinese stocks;
+	proc sql;
+	create table hmktcap as
+	select * from hmktcap_funda where
+	factset_entity_id in (select factset_entity_id from common.edm_standard_entity where iso_country eq 'CN')
+	union all
+	select * from hmktcap where
+	factset_entity_id not in (select factset_entity_id from common.edm_standard_entity where iso_country eq 'CN');
+
+	%end;
+%mend;
+
+%bdup(&bd_upd);
+* ......................................................................................;
+
+* ......................................................................................;
+* 13F Reports;
+* .....................................................................................;
+proc sql;
+create table own_inst_13f_detail as 
+select factset_entity_id, fsym_id, report_date, year(report_date)*100+qtr(report_date) as quarter, adj_holding
+from own.own_inst_13f_detail_eq
+where calculated quarter between &sqtr and &eqtr;
+
+proc sql;
+create table max13f as
+select  factset_entity_id, 
+		quarter, 
+		max(report_date) as maxofdlr 
+from own_inst_13f_detail
+group by factset_entity_id, quarter;
+
+proc sql;
+create table aux13f as
+select b.*, year(b.report_date)*100+month(b.report_date) as month
+from  max13f a, own_inst_13f_detail b
+where a.factset_entity_id eq b.factset_entity_id
+and   a.maxofdlr eq b.report_date;
+
+proc sql;
+create table v1_holdings13f as
+select t1.factset_entity_id, t1.fsym_ID, t1.quarter, t1.adj_holding, (t1.adj_holding*t3.adj_price/1000000) / t4.mktcap_usd as io
+from aux13f t1, own_basic t2, prices_historical t3, hmktcap t4
+where t1.fsym_ID eq t2.fsym_ID and t1.fsym_ID eq t3.fsym_ID and t1.month eq t3.month
+and t2.factset_entity_id eq t4.factset_entity_id and t1.month eq t4.month;
+
+* ......................................................................................;
+* Mutual Funds;
+* .....................................................................................;
+proc sql;
+create table own_fund_detail as 
+select factset_fund_id, fsym_id, report_date, year(report_date)*100+qtr(report_date) as quarter, adj_holding
+from own.own_fund_detail_eq
+where calculated quarter between &sqtr and &eqtr;
+
+proc sql;
+create table maxmf as
+select  factset_fund_id, 
+		quarter, 
+		max(report_date) as maxofdlr 
+from own_fund_detail
+group by factset_fund_id, quarter;
+
+proc sql;
+create table auxmf as
+select b.*, year(b.report_date)*100+month(b.report_date) as month
+from  maxmf a, own_fund_detail b
+where a.factset_fund_id eq b.factset_fund_id
+and   a.maxofdlr eq b.report_date;
+
+proc sql;
+create table v1_holdingsmf as
+select t1.factset_fund_id, t1.fsym_ID, t1.quarter, t1.adj_holding, (t1.adj_holding*t3.adj_price/1000000) / t4.mktcap_usd as io
+from auxmf t1, own_basic t2, prices_historical t3, hmktcap t4
+where t1.fsym_ID eq t2.fsym_ID and t1.fsym_ID eq t3.fsym_ID and t1.month eq t3.month
+and t2.factset_entity_id eq t4.factset_entity_id and t1.month eq t4.month;
+
+endrsubmit;
+
+rsubmit;
+/*******************************************************************/
+* Imputation of Institutions Portfolios (missing reports)			; 
+/*******************************************************************/
+%macro imputation(flag);
+
+%If &flag=1 %then 
+	%do;
+
+	proc fcmp outlib=sasuser.myfuncs.lionshares;
+			function quarter_add(q,x);
+				myear = int(q/100);
+				mquarter = mod(q,10);
+				years = floor(x/4);
+				quarters = (x - 4 * years);
+				if mquarter + quarters > 4 then result = (myear + years + 1)*100 + (mquarter + quarters - 4);
+				else result = (myear + years)*100+(mquarter + quarters);
+			return(result);
+			endsub;
+	run;
+	quit;
+
+	options cmplib=sasuser.myfuncs;
+	proc sql;
+	create table sym_range as
+	select fsym_ID, year(termination_date)*100+qtr(termination_date) as maxofqtr
+	from own_basic;
+
+	proc sql;
+	create table rangeofquarters as
+	select distinct quarter from own_inst_13f_detail order by quarter;
+
+	* 13F;
+	proc sql;
+	create table insts_13f as
+	select distinct factset_entity_id from own_inst_13f_detail order by factset_entity_id;
+
+	proc sql;
+	create table insts_13fdates as
+	select distinct factset_entity_id, quarter from insts_13f, rangeofquarters order by factset_entity_id, quarter;
+
+	proc sql;
+	create table pairs_13f as
+	select distinct factset_entity_id, quarter, 1 as has_report from own_inst_13f_detail order by factset_entity_id, quarter;
+
+	proc sql;
+	create table entity_minmax as
+	select factset_entity_id, min(quarter) as min_quarter, max(quarter) as max_quarter
+	from own_inst_13f_detail
+	group by factset_entity_id;
+
+	proc sql;
+	create table roll113f as
+	select a.*,
+		   case
+		   	  when b.has_report is missing then 0
+			  else b.has_report
+		   end as has_report,
+		   c.min_quarter,
+		   c.max_quarter as max_quarter_raw,
+		   case
+		   	  when c.max_quarter >= quarter_add(&eqtr,-&n2) then &eqtr
+			  else c.max_quarter
+		   end as max_quarter
+	from insts_13fdates a
+	left join pairs_13f b on a.factset_entity_id eq b.factset_entity_id and a.quarter eq b.quarter
+	inner join entity_minmax c on a.factset_entity_id eq c.factset_entity_id;
+
+	proc sql;
+	create table roll113f as select * from roll113f where quarter between min_quarter and max_quarter order by factset_entity_id, quarter;
+
+	proc sql;
+	create table roll13f as 
+	select a.*, b.quarter as last_qtr, (int(a.quarter/100) - int(b.quarter/100))*4 + mod(a.quarter,100) - mod(b.quarter,100) as dif_quarters,
+		   case
+			  when calculated dif_quarters le &n1 then 1
+			  else 0
+		   end as valid
+	from roll113f a, pairs_13f b
+	where a.factset_entity_id eq b.factset_entity_id and b.quarter <= a.quarter
+	order by a.factset_entity_id, a.quarter, b.quarter desc;
+
+	proc sort data=roll13f nodupkey; by factset_entity_id quarter; run;
+
+	proc sql;
+	create table fill_13f as
+	select *
+	from roll13f
+	where has_report eq 0 and valid eq 1;
+
+	proc sql;
+	create table inserts_13f as
+	select b.factset_entity_id, a.quarter, b.fsym_id, b.adj_holding, b.io 
+	from fill_13f a, v1_holdings13f b, sym_range c
+	where a.factset_entity_id eq b.factset_entity_id and a.last_qtr eq b.quarter
+	and b.fsym_id eq c.fsym_id and a.quarter lt c.maxofqtr;
+
+	proc sql;
+	create table v2_holdings13f as
+	select t2.factset_rollup_entity_id as factset_entity_id, t1.fsym_id, t1.quarter, sum(t1.io) as io
+	from (
+			select factset_entity_id, fsym_ID, quarter, io from v1_holdings13f
+			union all corr
+			select factset_entity_id, fsym_ID, quarter, io from inserts_13f
+		  ) t1,
+		  own.own_ent_13f_combined_inst t2
+	where t1.factset_entity_id eq t2.factset_filer_entity_id
+	group by t2.factset_rollup_entity_id, t1.fsym_id, t1.quarter;
+
+	* Mutual Funds;
+	proc sql;
+	create table insts_mf as
+	select distinct factset_fund_id from own_fund_detail order by factset_fund_id;
+
+	proc sql;
+	create table insts_mfdates as
+	select distinct factset_fund_id, quarter from insts_mf, rangeofquarters order by factset_fund_id, quarter;
+
+	proc sql;
+	create table pairs_mf as
+	select distinct factset_fund_id, quarter, 1 as has_report from own_fund_detail order by factset_fund_id, quarter;
+
+	proc sql;
+	create table fund_minmax as
+	select factset_fund_id, min(quarter) as min_quarter, max(quarter) as max_quarter
+	from own_fund_detail
+	group by factset_fund_id;
+
+	proc sql;
+	create table roll1mf as
+	select a.*,
+		   case
+		   	  when b.has_report is missing then 0
+			  else b.has_report
+		   end as has_report,
+		   c.min_quarter,
+		   c.max_quarter as max_quarter_raw,
+		   case
+		   	  when c.max_quarter >= quarter_add(&eqtr,-&n2) then &eqtr
+			  else c.max_quarter
+		   end as max_quarter
+	from insts_mfdates a
+	left join pairs_mf b on a.factset_fund_id eq b.factset_fund_id and a.quarter eq b.quarter
+	inner join fund_minmax c on a.factset_fund_id eq c.factset_fund_id;
+
+	proc sql;
+	create table roll1mf as select * from roll1mf where quarter between min_quarter and max_quarter order by factset_fund_id, quarter;
+
+	proc sql;
+	create table rollmf as 
+	select a.*, b.quarter as last_qtr, (int(a.quarter/100) - int(b.quarter/100))*4 + mod(a.quarter,100) - mod(b.quarter,100) as dif_quarters,
+		   case
+			  when calculated dif_quarters le &n1 then 1
+			  else 0
+		   end as valid
+	from roll1mf a, pairs_mf b
+	where a.factset_fund_id eq b.factset_fund_id and b.quarter <= a.quarter
+	order by a.factset_fund_id, a.quarter, b.quarter desc;
+
+	proc sort data=rollmf nodupkey; by factset_fund_id quarter; run;
+
+	proc sql;
+	create table fill_mf as
+	select *
+	from rollmf
+	where has_report eq 0 and valid eq 1;
+
+	proc sql;
+	create table inserts_mf as
+	select b.factset_fund_id, a.quarter, b.fsym_id, b.adj_holding, b.io 
+	from fill_mf a, v1_holdingsmf b, sym_range c
+	where a.factset_fund_id eq b.factset_fund_id and a.last_qtr eq b.quarter
+	and b.fsym_id eq c.fsym_id and a.quarter lt c.maxofqtr;
+
+	proc sql;
+	create table v2_holdingsmf as
+	select factset_inst_entity_id as factset_entity_id, fsym_ID, quarter, sum(io) as io
+	from (
+			select factset_fund_id, fsym_ID, quarter, io from v1_holdingsmf
+			union all corr
+			select factset_fund_id, fsym_ID, quarter, io from inserts_mf 
+		  ) t1,
+			own.own_ent_funds t2
+	where t1.factset_fund_id eq t2.factset_fund_id
+	group by factset_entity_id, fsym_ID, quarter;
+
+	%end;
+%else 
+	%do;
+	proc sql;
+	create table v2_holdings13f as
+	select t2.factset_rollup_entity_id as factset_entity_id, t1.fsym_id, t1.quarter, sum(t1.io) as io
+	from v1_holdings13f t1, own.own_ent_13f_combined_inst t2
+	where t1.factset_entity_id eq t2.factset_filer_entity_id
+	group by t2.factset_rollup_entity_id, t1.fsym_id, t1.quarter;
+
+	proc sql;
+	create table v2_holdingsmf as
+	select t2.factset_inst_entity_id as factset_entity_id, t1.fsym_ID, t1.quarter, sum(t1.io) as io
+	from v1_holdingsmf t1, own.own_ent_funds t2
+	where t1.factset_fund_id eq t2.factset_fund_id
+	group by t2.factset_inst_entity_id, t1.fsym_ID, t1.quarter;
+	%end;
+%mend;
+
+%imputation(&roll);
+/*******************************************************************/
+endrsubmit;
+
+rsubmit;
+* #7;
+/*******************************************************************/
+* Aggregates 13F with MF
+- step 1 - All 13F Reports
+- step 2 - All MF Reports filled by Non-13F Institutions
+- For Non-US Securities keep the maximum position between 13F and MF;
+/*******************************************************************/
+proc sql;
+create table inst_quarter_mf as
+select distinct factset_entity_id, quarter from v2_holdingsmf;
+create table inst_quarter_13f as
+select distinct factset_entity_id, quarter from v2_holdings13f;
+
+proc sql;
+create table inst_quarter_mf_only as
+select a.factset_entity_id, a.quarter
+from inst_quarter_mf a
+left join inst_quarter_13f b on (a.factset_entity_id = b.factset_entity_id and a.quarter = b.quarter)
+where b.factset_entity_id is missing and b.quarter is missing;
+
+proc sql;
+create table inst_quarter_13f_only as
+select a.factset_entity_id, a.quarter
+from inst_quarter_13f a
+left join inst_quarter_mf b on (a.factset_entity_id = b.factset_entity_id and a.quarter = b.quarter)
+where b.factset_entity_id is missing and b.quarter is missing;
+
+proc sql;
+create table inst_quarter_both as
+select a.factset_entity_id, a.quarter
+from inst_quarter_mf a, inst_quarter_13f b
+where a.factset_entity_id = b.factset_entity_id and a.quarter = b.quarter;
+
+proc sql;
+create table v1_holdingsall as
+select factset_entity_id, fsym_ID, quarter, max(io) as io
+from (
+	select factset_entity_id, fsym_ID, quarter, io from v2_holdings13f
+
+	union all corr
+
+	select b.factset_entity_id, b.fsym_ID, b.quarter, b.io
+	from inst_quarter_mf_only a, v2_holdingsmf b
+	where a.factset_entity_id eq b.factset_entity_id
+	and a.quarter eq b.quarter
+
+	union all corr
+
+	select c.factset_entity_id, c.fsym_ID, c.quarter, c.io
+	from inst_quarter_both a, own_basic b, v2_holdingsmf c
+	where b.iso_country ne 'US' and a.factset_entity_id = c.factset_entity_id
+	and a.quarter = c.quarter and b.fsym_ID = c.fsym_ID
+		)
+group by factset_entity_id, fsym_ID, quarter;
+/*******************************************************************/
+
+proc sql;
+create table v2_holdingsall as
+select  a.factset_entity_id, b.factset_entity_id as company_id, a.quarter, 
+		c.iso_country as inst_country, d.iso_country as sec_country, c.entity_sub_type,
+		sum(a.io) as io 
+from v1_holdingsall a, own_basic b, common.edm_standard_entity c, common.edm_standard_entity d
+where a.fsym_ID eq b.fsym_ID and a.factset_entity_id eq c.factset_entity_id
+and   b.factset_entity_id eq d.factset_entity_id
+and   b.factset_entity_id is not missing and a.io is not missing
+group by a.factset_entity_id, b.factset_entity_id, a.quarter, c.iso_country, d.iso_country, c.entity_sub_type;
+
+* adjustment factor for IO ratios gt 1;
+proc sql;
+create table adjfactor as
+select company_id, quarter, sum(io) as io, max(calculated io, 1) as adjf
+from v2_holdingsall group by company_id, quarter;
+
+* auxiliary table with information to compute several IO metrics;
+proc sql;
+create table v3_holdingsall as
+select  t1.company_id, t1.quarter, t1.factset_entity_id, t1.sec_country, t1.inst_country,
+		case
+		   when t1.sec_country eq t1.inst_country then 1
+		   else 0
+		end as is_dom length=3,
+		case
+		   when t1.inst_country eq 'US' then 1
+		   else 0
+		end as is_us_inst length=3, 
+		case
+		  when t3.cat_institution eq 1 then 1
+		  else 0
+		end as is_cat1,
+		case
+		  when t3.cat_institution eq 2 then 1
+		  else 0
+		end as is_cat2,
+		case
+		  when t3.cat_institution eq 3 then 1
+		  else 0
+		end as is_cat3,
+		case
+		  when t3.cat_institution eq 4 then 1
+		  else 0
+		end as is_cat4,
+		case
+		  when t3.cat_institution eq 5 then 1
+		  else 0
+		end as is_cat5,
+		case
+		  when t3.cat_institution eq 6 then 1
+		  else 0
+		end as is_cat6,
+		case
+		  when t3.cat_institution eq 7 then 1
+		  else 0
+		end as is_cat7,
+		t3.is_active,
+		t1.io as io_unadj,
+		t2.adjf,
+		t1.io/t2.adjf as io,
+		case
+		   when calculated io ge 0.01 then 1
+		   else 0
+		end as is_mv_ibh_1pct length=3,
+		case
+		   when calculated io ge 0.05 then 1
+		   else 0
+		end as is_mv_ibh_5pct length=3
+from v2_holdingsall t1, adjfactor t2, inst_type t3
+where t1.company_id eq t2.company_id and t1.quarter eq t2.quarter and t1.entity_sub_type eq t3.entity_sub_type
+order by t1.company_id, t1.quarter, calculated io desc;
+
+proc sql;
+create table v3_holdingsall as
+select t1.*, 
+		case 
+			when t2.common_law eq 1 then 1
+			else 0
+		end as common_law
+from v3_holdingsall t1 left join common_law t2 on (t1.inst_country eq t2.iso)
+order by t1.company_id, t1.quarter, t1.io desc;
+
+* ranks each institution by IO for each holding company;
+data v3_holdingsall;
+set v3_holdingsall;
+length is_mv_top5 3;
+by company_id quarter;
+mv_top+1;
+if first.quarter then mv_top=1;
+if mv_top le 5 then is_mv_top5=1; else is_mv_top5=0;
+run;
+
+* #14;
+* computes IO metrics for each company/quarter;
+proc sql;
+create table holdings_by_firm1 as
+select 	company_id,  
+		quarter,
+		sec_country,
+		count(*) as nbr_firms,
+		sum(io) as io, 
+	 	sum(io*is_dom) as io_dom,
+		sum(io*(1-is_dom)) as io_for,
+	 	sum(io*(1-is_dom)*is_us_inst) as io_for_us,
+	 	sum(io*(1-is_dom)*(1-is_us_inst)) as io_for_nus,
+		sum(io*common_law) as io_common,
+		sum(io*(1-common_law)) as io_civil,
+		sum(io*(1-is_dom)*common_law) as io_for_common,
+		sum(io*(1-is_dom)*(1-common_law)) as io_for_civil,
+		sum(io*is_mv_ibh_5pct) as ibh_5pct,
+		sum(io*is_mv_ibh_1pct) as ibh_1pct,
+		sum(io*is_mv_top5) as top5,
+		sum(io**2)/sum(io)**2 as herf
+from v3_holdingsall
+group by company_id, quarter, sec_country;
+
+* Fetch Principal Security;
+proc sql;
+create table principal_security as
+select *
+from common.sym_coverage a
+left join own.own_sec_entity_eq b on a.fsym_id eq b.fsym_id
+where b.factset_entity_id in (select distinct company_id from holdings_by_firm1)
+and b.factset_entity_id is not missing
+and a.fsym_id eq a.fsym_primary_equity_id
+order by b.factset_entity_id;
+
+proc sort data=principal_security nodupkey; by factset_entity_id; run;
+
+* Remaining securities (Share & Prefeq);
+proc sql;
+create table remaining_securities as
+select *
+from common.sym_coverage a
+left join own.own_sec_entity_eq b on a.fsym_id eq b.fsym_id
+where b.factset_entity_id in (select distinct company_id from holdings_by_firm1)
+and b.factset_entity_id not in (select factset_entity_id from principal_security)
+and b.factset_entity_id is not missing
+and a.fref_security_type in ('SHARE','PREFEQ')
+order by b.factset_entity_id, a.active_flag desc, a.fref_security_type desc;
+
+proc sort data=remaining_securities nodupkey; by factset_entity_id; run;
+
+proc sql;
+create table security_entity1 as
+select factset_entity_id, fsym_id from principal_security
+union all
+select factset_entity_id, fsym_id from remaining_securities;
+
+proc sql;
+create table security_entity as
+select a.*, b.fsym_primary_listing_id
+from security_entity1 a
+left join common.sym_coverage b on a.fsym_id eq b.fsym_id;
+
+proc sql;
+create table entity_identifiers as
+select a.*, 
+	   case
+	      when b.isin is missing then c.isin
+		  else b.isin
+	   end as isin, 
+	   d.cusip,
+	   e.sedol,
+	   f.ticker_region
+from security_entity a
+left join common.sym_isin b on a.fsym_id eq b.fsym_id
+left join common.sym_xc_isin c on a.fsym_id eq c.fsym_id
+left join common.sym_cusip d on a.fsym_id eq d.fsym_id
+left join common.sym_sedol e on a.fsym_primary_listing_id eq e.fsym_id
+left join common.sym_ticker_region f on a.fsym_primary_listing_id eq f.fsym_id;
+
+* merges IO metrics with market_cap and entity identifiers;
+proc sql stimer;
+create table holdings_by_firm2 as
+select  a.company_id, a.quarter, a.sec_country, c.entity_proper_name,
+		b.mktcap_usd as mktcap, b.mktcap_usd*a.io as io_usd, a.*
+from holdings_by_firm1 a, hmktcap b, common.edm_standard_entity c
+where b.eoq eq 1 and a.company_id eq b.factset_entity_id and a.quarter eq b.quarter and a.company_id eq c.factset_entity_id;
+
+proc sql stimer;
+create table holdings_by_firm as
+select  a.company_id, a.quarter, a.sec_country, a.entity_proper_name, b.isin, b.cusip, b.sedol, b.ticker_region as ticker, a.*
+from holdings_by_firm2 a
+left join entity_identifiers b on a.company_id eq b.factset_entity_id;
+
+* excludes REITS (sic_code eq '6798');
+proc sql;
+create table holdings_by_firm_all (drop=company_id) as
+select  a.company_id as factset_entity_id, a.quarter, intnx('month',yyq(int(quarter/100),mod(quarter,100)),2,'end') format=MMDDYY10. as rquarter, a.sec_country, a.entity_proper_name, a.*
+from holdings_by_firm a
+where a.company_id not in (select factset_entity_id from common.edm_standard_entity where primary_sic_code eq '6798')
+order by a.company_id, a.quarter;
+
+* final table restricted to MSCI ACWI countries (+ Luxembourg);
+proc sql stimer;
+create table holdings_by_firm_msci as
+select b.* from ctry a, holdings_by_firm_all b where a.iso eq b.sec_country;
