@@ -17,9 +17,14 @@ This logic should be used for UKSR securities (own_sec_coverage.fds_uksr_flag=1)
 • If there is no stakes-base source, or if the report_date is older than 18 months, sum of funds
 can be used if available
 
+Position is in terms of adjusted shares.
+
+Adjusted shares are used because adjusted positions can be used
+in quarter-to-quarter analysis for the calculation of other variables in
+an apples-to-apples setting.
 
 Output:
-    scheme_4.parquet
+    scheme_4_adj_shares_held.parquet
 
 
 """
@@ -119,13 +124,18 @@ own_ent_funds = (
             )
 
 
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #    FORMAT OWN_INST_STAKES TABLE
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 own_inst_stakes = pl.read_parquet(os.path.join(own_inst_13f_dir, 'own_inst_stakes_detail_eq.parquet'),
                              use_pyarrow=True)
+
 # Define quarter date 'date_q'
 own_inst_stakes = apply_quarter_scheme(own_inst_stakes, 'AS_OF_DATE')
+
+# Keep only positive positions
+own_inst_stakes = own_inst_stakes.filter(pl.col('POSITION')>0)
 
 # Isolate columns for Scheme 4 (UKSR securities)
 own_inst_stakes_uksr =  own_inst_stakes.select(['FSYM_ID',
@@ -142,13 +152,15 @@ own_inst_stakes =  own_inst_stakes.select(['FSYM_ID',
                                             'POSITION',
                                             'date_q'])
 
+
+
 # ///////////////////////////////////////////////////////
 
 #         For UKSR securities  - SCHEME 4
 
 # ///////////////////////////////////////////////////////
 
-print('UKSR securities - SCHEME 4 \n')
+print('UKSR securities - SCHEME 4 (ADJ SHARES HELD) \n')
 
 
 # UKSR securities
@@ -158,9 +170,9 @@ security_uksr_set = set(security_uksr['FSYM_ID'])
 # Source code for Stakes
 source_code_uksr = set(['W', 'Q', 'H'])
 
-# -----------------------------
-#     MASTER DATAFRAME - SETTING UP 
-# -----------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#     MASTER DATAFRAME - SETTING UP THE SECURITY+HOLDER+QUARTER PAIR
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Define a master dataframe for scheme 4 (similar to scheme 3)
 # The master dataframe will have as rows all combinations of
@@ -168,7 +180,7 @@ source_code_uksr = set(['W', 'Q', 'H'])
 
 # Quarter dates (including 202312 and excluding 202403)
 date_range = pd.date_range(start = pd.to_datetime('198809', format='%Y%m'), 
-                         end   = pd.to_datetime('202403', format='%Y%m'), 
+                         end   = pd.to_datetime('202406', format='%Y%m'), 
                          freq  = 'Q')
 
 date_range_int = [int(x.strftime('%Y%m')) for x in date_range]
@@ -211,6 +223,9 @@ for dataset in os.listdir(own_funds_dir):
     own_fund = pl.read_parquet(os.path.join(own_funds_dir, dataset),
                                use_pyarrow=True)
     
+    # Keep positive positions
+    own_fund = own_fund.filter(pl.col('REPORTED_HOLDING')>0)
+    
     
     # Merge Fund with Institution that manages the Fund
     own_fund = own_fund.join(own_ent_funds, 
@@ -230,10 +245,13 @@ for dataset in os.listdir(own_funds_dir):
     funds_pairs = pl.concat([funds_pairs, funds_pairs_])
     
     
-# Concat and keep unique
+# Concat and keep unique pairs
+funds_pairs = funds_pairs.unique()
+
+# All unique pairs
 valid_pairs = pl.concat([stakes_pairs, funds_pairs]).unique()
 
-
+# Initialize scheme 4 dataframe
 scheme_4 = valid_pairs.join(quarters_pl, how='cross')
 
 # Free memory
@@ -241,35 +259,56 @@ del stakes_pairs, funds_pairs
 
 
 
-# ----------------------------
-#   GET POSITIIONS FOR STAKES 
-# -----------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   POSITIIONS FROM STAKES TABLE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Keep only the most recent 'AS_OF_DATE' observation within quarter
-own_inst_stakes_ = ( 
-    own_inst_stakes_uksr
-    .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
-    .agg([pl.all().sort_by('AS_OF_DATE').last()])
-    )
 
-stakes_positions = (
-    own_inst_stakes_.filter(
+# Filter for UKSR securities
+stakes_positions = own_inst_stakes_uksr.filter(
     pl.col('FSYM_ID').is_in(security_uksr_set) &
     pl.col('SOURCE_CODE').is_in(source_code_uksr)
     )
-    .select(['FSYM_ID','FACTSET_ENTITY_ID', 'date_q', 'POSITION' ])
-    .rename({'POSITION' : 'ADJ_SHARES_HELD_STAKES'})
+
+
+    
+
+# Keep only the most recent 'AS_OF_DATE' observation within quarter
+stakes_positions = ( 
+    stakes_positions
+    .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
+    .agg(pl.all().sort_by('AS_OF_DATE').last())
     )
 
+# Re-order and keep cols
+stakes_positions = ( 
+                    stakes_positions
+                    .select(['FSYM_ID',
+                            'FACTSET_ENTITY_ID',
+                            'AS_OF_DATE',
+                            'POSITION',
+                            'date_q'])
+                    .drop_nulls()
+                    )
 
-# MERGE WITH MASTER DATAFRAME
+
+# Rename
+stakes_positions = stakes_positions.rename({'POSITION' : 'ADJ_SHARES_HELD_STAKES'})
+
+
+
+# -----------------------------------------------------
+#           MERGE WITH MASTER DATAFRAME
+# -----------------------------------------------------
+
+
 scheme_4 = scheme_4.join(stakes_positions, how='left',
                          on=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
 
-# ---------------------------------
-#   GET POSITIONS FOR FUNDS
-# ---------------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    POSITIONS FROM FUNDS TABLE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Define DataFrame to store
 funds_positions = pl.DataFrame()
@@ -284,6 +323,9 @@ for dataset in os.listdir(own_funds_dir):
     own_fund = pl.read_parquet(os.path.join(own_funds_dir, dataset),
                                use_pyarrow=True)
     
+    # Keep positive positions
+    own_fund = own_fund.filter(pl.col('REPORTED_HOLDING')>0)
+    
     
     # Merge Fund with Institution that manages the Fund
     own_fund = own_fund.join(own_ent_funds, 
@@ -291,7 +333,7 @@ for dataset in os.listdir(own_funds_dir):
                              on='FACTSET_FUND_ID')
     
 
-    # Filter 
+    # Filter for UKSR securites
     own_fund_ =  own_fund.filter(
         pl.col('FSYM_ID').is_in(security_uksr_set) 
         )
@@ -305,17 +347,17 @@ for dataset in os.listdir(own_funds_dir):
         own_fund_
         .sort(['FSYM_ID', 'FACTSET_FUND_ID', 'date_q', 'REPORT_DATE'])
         .group_by(['FSYM_ID', 'FACTSET_FUND_ID', 'date_q'])
-        .agg([pl.all().sort_by('REPORT_DATE').last()])
+        .agg(pl.all().sort_by('REPORT_DATE').last())
         )
     
     own_fund_ = own_fund_.select(['FSYM_ID',
                                   'FACTSET_ENTITY_ID',
                                   'REPORT_DATE',
-                                  'ADJ_HOLDING',
-                                  'REPORTED_HOLDING',
-                                  'date_q'])
+                                  'date_q',
+                                  'ADJ_HOLDING'])
     
     
+    # Sum the position of an institution for each security within a quarter
     own_fund_inst = ( 
         own_fund_
         .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
@@ -332,20 +374,37 @@ funds_positions = (
     funds_positions
     .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
     .agg(pl.col('ADJ_HOLDING').sum())
-    .rename({'ADJ_HOLDING' : 'ADJ_SHARES_HELD_FUNDS'})
-    )    
+    )  
+
+
+# Zero adjusted positions are null
+funds_positions = funds_positions.with_columns(
+                        pl.when(pl.col('ADJ_HOLDING')==0)
+                        .then(None)
+                        .otherwise('ADJ_HOLDING')
+                        .alias('ADJ_HOLDING')
+                        )
+
+# Drop null values of adjusted positions
+funds_positions = funds_positions.drop_nulls(['ADJ_HOLDING'])
+# Rename
+funds_positions = funds_positions.rename({'ADJ_HOLDING' : 'ADJ_SHARES_HELD_FUNDS'})
+
+  
     
 
 
+# -----------------------------------------------------
+#           MERGE WITH MASTER DATAFRAME
+# -----------------------------------------------------
 
-# MERGE WITH MASTER DATAFRAME
 scheme_4 = scheme_4.join(funds_positions, how='left',
                          on=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
 
-# ----------------------
-#   WINDOW OF 18 MONTHS
-# ------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#           WINDOW OF 18 MONTHS FOR UKSR SECURITIES 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Compare the perspective date to the as_of_date and forward fill null positions
 # using an 18 month or 6 quarter window.
@@ -356,16 +415,29 @@ scheme_4 = scheme_4.with_columns(
             .alias('ADJ_SHARES_HELD_STAKES_FILLED')
             )
 
-# Replace stake position with a fund position 
-# only if a stake position is null and a fund position exists
+
+# Use a filled stakes position if it exists.
+# Otherwise use a funds position.
 scheme_4_final = ( 
     scheme_4.with_columns(
-    pl.when(pl.col('ADJ_SHARES_HELD_STAKES_FILLED').is_null() & 
-            (~pl.col('ADJ_SHARES_HELD_FUNDS').is_null()) )
-    .then(pl.col('ADJ_SHARES_HELD_FUNDS'))
-    .otherwise(pl.col('ADJ_SHARES_HELD_STAKES_FILLED'))
+    pl.when(pl.col('ADJ_SHARES_HELD_STAKES_FILLED').is_not_null())
+    .then(pl.col('ADJ_SHARES_HELD_STAKES_FILLED'))
+    .otherwise(pl.col('ADJ_SHARES_HELD_FUNDS'))
     .alias('ADJ_SHARES_HELD')
     )
+    )
+
+
+# Free memory
+del scheme_4, funds_positions, stakes_positions, own_fund, own_fund_, own_fund_inst
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    SOME HOUSEKEEPING
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Select and drop nulls
+scheme_4_final = (
+    scheme_4_final
     .select(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q', 'ADJ_SHARES_HELD' ])
     .drop_nulls()
     )
@@ -376,13 +448,10 @@ scheme_4_final = scheme_4_final.with_columns(
    pl.lit(4).alias('SCHEME')               
     ) 
 
-# Free memory
-del scheme_4, funds_positions, stakes_positions, own_fund, own_fund_, own_fund_inst
 
 # ~~~~~~~~~~~~~~
 #   SAVE
 # ~~~~~~~~~~~
 
-
-scheme_4_final.write_parquet(os.path.join(cd, 'scheme_4.parquet'))
+scheme_4_final.write_parquet(os.path.join(cd, 'scheme_4_adj_shares_held.parquet'))
 

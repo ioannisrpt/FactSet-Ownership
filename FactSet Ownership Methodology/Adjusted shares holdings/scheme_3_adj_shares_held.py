@@ -22,8 +22,15 @@ o Global securities: 21 months
 • If there is no stakes-base source, or if the report_date is outside of the window, sum of funds
 can be used if available.
 
+
+Position is in terms of adjusted shares.
+
+Adjusted shares are used because adjusted positions can be used
+in quarter-to-quarter analysis for the calculation of other variables in
+an apples-to-apples setting.
+
 Output:
-    scheme_3.parquet
+    scheme_3_adj_shares_held.parquet
 
 
 """
@@ -122,14 +129,19 @@ own_ent_funds = (
             )
 
 
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #    FORMAT OWN_INST_STAKES TABLE
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 own_inst_stakes = pl.read_parquet(os.path.join(own_inst_13f_dir, 'own_inst_stakes_detail_eq.parquet'),
                              use_pyarrow=True)
+
 # Define quarter date 'date_q'
 own_inst_stakes = apply_quarter_scheme(own_inst_stakes, 'AS_OF_DATE')
 
+# Keep only positive positions
+own_inst_stakes = own_inst_stakes.filter(pl.col('POSITION')>0)
 
 # Isoalate columns for Scheme 1, 2, 3
 own_inst_stakes =  own_inst_stakes.select(['FSYM_ID',
@@ -140,13 +152,14 @@ own_inst_stakes =  own_inst_stakes.select(['FSYM_ID',
 
 
 
+
 # ///////////////////////////////////////////////////////
 
 #    For non 13F Holder and non 13F Securities  - SCHEME 3
 
 # ///////////////////////////////////////////////////////
 
-print('13F Holder + non 13F Securities - SCHEME 3 \n')
+print('13F Holder + non 13F Securities - SCHEME 3 (ADJ SHARES HELD) \n')
 
 
 
@@ -154,33 +167,30 @@ print('13F Holder + non 13F Securities - SCHEME 3 \n')
 non_holder_13f = own_ent_inst.filter(pl.col('FDS_13F_FLAG') == 0) 
 non_holder_13f_set = set(non_holder_13f['FACTSET_ENTITY_ID'])
 
-# non - 13F Canadian security
-security_non_ca_13f = own_sec_cov.filter(pl.col('FDS_13F_CA_FLAG') == 0) 
-security_non_ca_13f_set = set(security_non_ca_13f['FSYM_ID'])
-    
-# non - 13F US security
-security_non_us_13f = own_sec_cov.filter(pl.col('FDS_13F_FLAG') == 0) 
-security_non_us_13f_set = set(security_non_us_13f['FSYM_ID'])
-
-# non - UKSR security 
-security_non_uksr =  own_sec_cov.filter(pl.col('FDS_UKSR_FLAG') == 0) 
-security_non_uksr_set = set(security_non_uksr['FSYM_ID'])
-
-# non 13F Canadian or US security AND non -UKSR security 
-security_non_13f_set = (security_non_ca_13f_set | security_non_us_13f_set) & security_non_uksr_set
 
 
-# -----------------------------
-#     MASTER DATAFRAME - SETTING UP 
-# -----------------------------
+# non 13F Canadian or US security or UKSR security 
+own_sec_cov = own_sec_cov.with_columns(
+    (pl.col('FDS_13F_FLAG') + pl.col('FDS_13F_CA_FLAG') + pl.col('FDS_UKSR_FLAG'))
+    .alias('IS_13F_OR_UK')
+    )
+
+security_non_13f = own_sec_cov.filter(pl.col('IS_13F_OR_UK') == 0) 
+security_non_13f_set = set(security_non_13f['FSYM_ID'])
+
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#     MASTER DATAFRAME - SETTING UP THE SECURITY+HOLDER+QUARTER PAIR
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Define a master dataframe for scheme 3
 # The master dataframe will have as rows all combinations of
-# non 13F holders + non 13F US and Canadian securities + quarter dates
+# non 13F holders + non 13F US and Canadian or UK securities + quarter dates
 
 # Quarter dates (including 202312 but excluding 202403)
 date_range = pd.date_range(start = pd.to_datetime('198809', format='%Y%m'), 
-                         end   = pd.to_datetime('202403', format='%Y%m'), 
+                         end   = pd.to_datetime('202406', format='%Y%m'), 
                          freq  = 'Q')
 
 date_range_int = [int(x.strftime('%Y%m')) for x in date_range]
@@ -191,12 +201,12 @@ quarters_pl = pl.DataFrame({'date_q' :date_range_int }).cast(pl.Int32)
 # and then then expand on quarter dates 
 
 # -------------
-#    13F table
+#  Stakes table
 # --------------
 
 
 # Finding the valid holder-securities pairs from Stakes Table
-# Filter for 13f Canadian security +  13f holder 
+# Filter for non-13F or UK security and non 13f holder
 stakes_pairs = (
     own_inst_stakes.filter(
     pl.col('FSYM_ID').is_in(security_non_13f_set) &
@@ -208,7 +218,7 @@ stakes_pairs = (
 
 
 # ---------------------
-#  SUM OF FUNDS table
+#   Funds table
 # ----------------------
 
 # Finding the valid holder-securities pairs from Funds Tables
@@ -222,6 +232,9 @@ for dataset in os.listdir(own_funds_dir):
     # Import sum of funds dataset
     own_fund = pl.read_parquet(os.path.join(own_funds_dir, dataset),
                                use_pyarrow=True)
+    
+    # Keep positive positions
+    own_fund = own_fund.filter(pl.col('REPORTED_HOLDING')>0)
     
     
     # Merge Fund with Institution that manages the Fund
@@ -243,44 +256,68 @@ for dataset in os.listdir(own_funds_dir):
     funds_pairs = pl.concat([funds_pairs, funds_pairs_])
     
     
-# Concat and keep unique
+# Concat and keep unique pairs
+funds_pairs = funds_pairs.unique()
+
+# All unique pairs
 valid_pairs = pl.concat([stakes_pairs, funds_pairs]).unique()
 
-
+# Initialize scheme 3 dataframe
 scheme_3 = valid_pairs.join(quarters_pl, how='cross')
 
 
 # Free memory
 del stakes_pairs, funds_pairs
 
-# ----------------------------
-#   GET POSITIIONS FOR STAKES 
-# -----------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   POSITIIONS FROM STAKES TABLE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Keep only the most recent 'AS_OF_DATE' observation within quarter
-own_inst_stakes_ = ( 
-    own_inst_stakes
-    .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
-    .agg([pl.all().sort_by('AS_OF_DATE').last()])
-    )
 
-stakes_positions = (
-    own_inst_stakes_.filter(
+# Filter for 13f Canadian security +  13f holder 
+stakes_positions =  own_inst_stakes.filter(
     pl.col('FSYM_ID').is_in(security_non_13f_set) &
     pl.col('FACTSET_ENTITY_ID').is_in(non_holder_13f_set)
     )
-    .select(['FSYM_ID','FACTSET_ENTITY_ID', 'date_q', 'POSITION' ])
-    .rename({'POSITION' : 'ADJ_SHARES_HELD_STAKES'})
+
+
+# Keep only the most recent 'AS_OF_DATE' observation within quarter
+stakes_positions = ( 
+    stakes_positions
+    .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
+    .agg(pl.all().sort_by('AS_OF_DATE').last())
     )
 
 
-# MERGE WITH MASTER DATAFRAME
+
+# Re-order and keep cols
+stakes_positions = ( 
+                    stakes_positions
+                    .select(['FSYM_ID',
+                            'FACTSET_ENTITY_ID',
+                            'AS_OF_DATE',
+                            'POSITION',
+                            'date_q'])
+                    .drop_nulls()
+                    )
+
+# Rename
+stakes_positions = stakes_positions.rename({'POSITION' : 'ADJ_SHARES_HELD_STAKES'})
+
+
+
+
+# -----------------------------------------------------
+#           MERGE WITH MASTER DATAFRAME
+# -----------------------------------------------------
+
+
 scheme_3 = scheme_3.join(stakes_positions, how='left',
                          on=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
-# ---------------------------------
-#   GET POSITIONS FOR FUNDS
-# ---------------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#    POSITIONS FROM FUNDS TABLE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Define DataFrame to store
 funds_positions = pl.DataFrame()
@@ -294,6 +331,9 @@ for dataset in os.listdir(own_funds_dir):
     # Import sum of funds dataset
     own_fund = pl.read_parquet(os.path.join(own_funds_dir, dataset),
                                use_pyarrow=True)
+    
+    # Keep positive positions
+    own_fund = own_fund.filter(pl.col('REPORTED_HOLDING')>0)
     
     
     # Merge Fund with Institution that manages the Fund
@@ -317,21 +357,20 @@ for dataset in os.listdir(own_funds_dir):
         own_fund_
         .sort(['FSYM_ID', 'FACTSET_FUND_ID', 'date_q', 'REPORT_DATE'])
         .group_by(['FSYM_ID', 'FACTSET_FUND_ID', 'date_q'])
-        .agg([pl.all().sort_by('REPORT_DATE').last()])
+        .agg(pl.all().sort_by('REPORT_DATE').last())
         )
+    
     
     own_fund_ = own_fund_.select(['FSYM_ID',
                                   'FACTSET_ENTITY_ID',
+                                  'date_q',
                                   'REPORT_DATE',
-                                  'ADJ_HOLDING',
-                                  'REPORTED_HOLDING',
-                                  'date_q'])
+                                  'ADJ_HOLDING'])
+       
     
     
-    
-    # Sum the position of an institution for each securiting within a quarter
-    # and across funds   
-    own_fund_inst = ( 
+    # Sum the position of an institution for each security within a quarter
+    own_fund_inst = (
         own_fund_
         .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
         .agg(pl.col('ADJ_HOLDING').sum())
@@ -349,19 +388,34 @@ funds_positions = (
     funds_positions
     .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
     .agg(pl.col('ADJ_HOLDING').sum())
-    .rename({'ADJ_HOLDING' : 'ADJ_SHARES_HELD_FUNDS'})
     )     
 
+# Zero adjusted positions are null
+funds_positions = funds_positions.with_columns(
+                        pl.when(pl.col('ADJ_HOLDING')==0)
+                        .then(None)
+                        .otherwise('ADJ_HOLDING')
+                        .alias('ADJ_HOLDING')
+                        )
+
+# Drop null values of adjusted positions
+funds_positions = funds_positions.drop_nulls(['ADJ_HOLDING'])
+# Rename
+funds_positions = funds_positions.rename({'ADJ_HOLDING' : 'ADJ_SHARES_HELD_FUNDS'})
 
 
-# MERGE WITH MASTER DATAFRAME
+
+# -----------------------------------------------------
+#           MERGE WITH MASTER DATAFRAME
+# -----------------------------------------------------
+
 scheme_3 = scheme_3.join(funds_positions, how='left',
                          on=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
 
-# ----------------------
-#   WINDOW OF 18 and 21 MONTHS
-# ------------------------
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  WINDOW OF 18 MONTHS FOR NA SECURITIES and 21 MONTHS FOR GLOBAL SECURITIES
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Compare the perspective date to the as_of_date and forward fill null positions
 # using the following windows:
@@ -371,10 +425,11 @@ scheme_3 = scheme_3.join(funds_positions, how='left',
 
 # I need to augment with iso_country of each security using own_sec_coverage
 # table
-isin = pl.read_parquet(os.path.join(factset_dir, 'own_sec_coverage_eq.parquet'),
+iso_country = pl.read_parquet(os.path.join(factset_dir, 'own_sec_coverage_eq.parquet'),
                                use_pyarrow=True, columns =['FSYM_ID', 'ISO_COUNTRY'])
 
-scheme_3 = scheme_3.join(isin, how='left', on=['FSYM_ID'])
+scheme_3 = scheme_3.join(iso_country, how='left', on=['FSYM_ID'])
+
 # Classify stocks into NA securities and Global securities
 scheme_3 = scheme_3.with_columns(
     pl.when(pl.col('ISO_COUNTRY').is_in(set(['US', 'CA'])))
@@ -382,6 +437,11 @@ scheme_3 = scheme_3.with_columns(
     .otherwise(0)
     .alias('IS_NA_SECURITY')
     )
+
+# Split the dataset into NA and Global securities,
+# apply the forward filling of up to 6 or 7 quarters
+# in each dataset separately and then merge them.
+# There must be a cleaner way to do this.
 
 # For NA securities fill position 6 quarters ahead
 scheme_3_na = ( 
@@ -412,19 +472,27 @@ scheme_3_global = (
 scheme_3 = pl.concat([scheme_3_na, scheme_3_global])
 
 # Free memory
-del scheme_3_na, scheme_3_global, isin
+del scheme_3_na, scheme_3_global, iso_country
 
-# Replace stake position with a fund position 
-# only if a stake position is null and a fund position exists
-# Select columns and drop null positions
+# Use a filled stakes position if it exists.
+# Otherwise use a funds position.
 scheme_3_final = ( 
     scheme_3.with_columns(
-    pl.when(pl.col('ADJ_SHARES_HELD_STAKES_FILLED').is_null() & 
-            (~pl.col('ADJ_SHARES_HELD_FUNDS').is_null()) )
-    .then(pl.col('ADJ_SHARES_HELD_FUNDS'))
-    .otherwise(pl.col('ADJ_SHARES_HELD_STAKES_FILLED'))
+    pl.when(pl.col('ADJ_SHARES_HELD_STAKES_FILLED').is_not_null())
+    .then(pl.col('ADJ_SHARES_HELD_STAKES_FILLED'))
+    .otherwise(pl.col('ADJ_SHARES_HELD_FUNDS'))
     .alias('ADJ_SHARES_HELD')
     )
+    )
+    
+    
+# ~~~~~~~~~~~~~~~~~~~~~~   
+#    SOME HOUSEKEEPING
+# ~~~~~~~~~~~~~~~~~~~~~~
+
+# Select columns and drop null positions
+scheme_3_final = (
+    scheme_3_final
     .select(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q', 'ADJ_SHARES_HELD' ])
     .drop_nulls()
     )
@@ -442,6 +510,6 @@ del scheme_3, funds_positions, stakes_positions, own_fund, own_fund_, own_fund_i
 # ~~~~~~~~~~~~~~
 #   SAVE
 # ~~~~~~~~~~~
-scheme_3_final.write_parquet(os.path.join(cd, 'scheme_3.parquet'))
+scheme_3_final.write_parquet(os.path.join(cd, 'scheme_3_adj_shares_held.parquet'))
 
 

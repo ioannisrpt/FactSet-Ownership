@@ -25,11 +25,11 @@ import polars as pl
 # ~~~~~~~~~~~~~~~~~~
 
 # Current directory
-#cd = r'C:\Users\FMCC\Desktop\Ioannis'
+cd = r'C:\Users\FMCC\Desktop\Ioannis'
 
 # Parquet Factset tables
-#factset_dir =  r'C:\FactSet_Downloadfiles\zips\parquet'
-factset_dir = r'C:\Users\ropot\Desktop\Financial Data for Research\FactSet'
+factset_dir =  r'C:\FactSet_Downloadfiles\zips\parquet'
+#factset_dir = r'C:\Users\ropot\Desktop\Financial Data for Research\FactSet'
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -232,7 +232,9 @@ mcap_eq = (
 
 
 # Save
-mcap_eq.write_parquet(os.path.join(factset_dir, 'mcap_security_level.parquet'))
+#mcap_eq.write_parquet(os.path.join(factset_dir, 'mcap_security_level.parquet'))
+mcap_eq.write_parquet(os.path.join(cd, 'mcap_security_level.parquet'))
+
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   SUM MARKET CAP OF DIFFERENT SECURITIES FOR EACH ENTITY-QUARTER
@@ -256,7 +258,8 @@ mcap_total = mcap_total.sort(by=['FACTSET_ENTITY_ID_FROM_FSYM_ID', 'date_q'])
 #    SAVE
 # ~~~~~~~~~~
 
-mcap_total.write_parquet(os.path.join(factset_dir, 'mcap_total_company_level.parquet'))
+#mcap_total.write_parquet(os.path.join(factset_dir, 'mcap_total_company_level.parquet'))
+mcap_total.write_parquet(os.path.join(cd, 'mcap_total_company_level.parquet'))
 
 
 

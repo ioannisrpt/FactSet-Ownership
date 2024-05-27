@@ -2,25 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Concatenate datasets constructed from the 4 Schemes
-
-Load the datasets constructed using the FactSet Ownership
-Methodology and concatenate them into one master dataset. 
-There are 4 schemes/parts of the master dataset:
-scheme 1 : 13f holder + 13f US security
-scheme 2 : 13f holder + 13f Canadian security
-scheme 3: non 13f holder + non 13f and UKSR security
-scheme 4: UKSR securities
-
-Inputs:
-    scheme_1.parquet
-    scheme_2.parquet
-    scheme_3.parquet
-    scheme_4.parquet
-    
-
-Output:
-    factset_holdings.parquet
-
 """
 
 
@@ -63,17 +44,16 @@ own_funds_dir = os.path.join(factset_dir, 'own_fund_eq_v5_full')
 # ~~~~~~~~~~~~~~~~
 
 
-# Import datasets from schemes
-scheme_1 = pl.read_parquet(os.path.join(cd, 'scheme_1.parquet'))
+scheme_1 = pl.read_parquet(os.path.join(cd, 'scheme_1_adj_shares_held.parquet'))
 #any_duplicates(scheme_1, main_cols)
 
-scheme_2 = pl.read_parquet(os.path.join(cd, 'scheme_2.parquet'))
+scheme_2 = pl.read_parquet(os.path.join(cd, 'scheme_2_adj_shares_held.parquet'))
 #any_duplicates(scheme_2, main_cols)
 
-scheme_3 = pl.read_parquet(os.path.join(cd, 'scheme_3.parquet'))
+scheme_3 = pl.read_parquet(os.path.join(cd, 'scheme_3_adj_shares_held.parquet'))
 #any_duplicates(scheme_3, main_cols)
 
-scheme_4 = pl.read_parquet(os.path.join(cd, 'scheme_4.parquet'))
+scheme_4 = pl.read_parquet(os.path.join(cd, 'scheme_4_adj_shares_held.parquet'))
 #any_duplicates(scheme_4, main_cols)
 
 # ~~~~~~~~~~~~
@@ -87,10 +67,10 @@ fh = pl.concat([scheme_1,
 
 
 # Sort
-fh = fh.sort(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
+#fh = fh.sort(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
 # Save
-fh.write_parquet(os.path.join(cd, 'factset_ownership_holdings.parquet' ))
+fh.write_parquet(os.path.join(cd, 'factset_adj_shares_holdings.parquet' ))
 
 
 

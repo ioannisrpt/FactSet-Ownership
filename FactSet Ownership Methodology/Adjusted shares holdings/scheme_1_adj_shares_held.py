@@ -21,10 +21,15 @@ stakes-based position in own_inst_stakes_detail
 position for the security+holder combination.
 
 
-Position is in terms of adjusted number of shares.
+Position is in terms of adjusted shares holdings.
+
+Adjusted shares are used because adjusted positions can be used
+in quarter-to-quarter analysis for the calculation of other variables in
+an apples-to-apples setting.
     
 Output:
     scheme_1_adj_shares_held.parquet
+    
 
 
 """
@@ -112,6 +117,10 @@ own_ent_funds = (
             )
 
 
+
+
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #    FORMAT OWN_INST_STAKES TABLE
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -119,6 +128,9 @@ own_inst_stakes = pl.read_parquet(os.path.join(own_inst_13f_dir, 'own_inst_stake
                              use_pyarrow=True)
 # Define quarter date 'date_q'
 own_inst_stakes = apply_quarter_scheme(own_inst_stakes, 'AS_OF_DATE')
+
+# Keep only positive positions
+own_inst_stakes = own_inst_stakes.filter(pl.col('POSITION')>0)
 
 # Isolate columns for Scheme 4 (UKSR securities)
 own_inst_stakes_uksr =  own_inst_stakes.select(['FSYM_ID',
@@ -157,9 +169,9 @@ security_13f_set = set(security_13f['FSYM_ID'])
 # Define dataframe to save 
 scheme_1 = pl.DataFrame()
 
-# -------------------
-#   13F table
-# ------------------
+# ~~~~~~~~~~~~~~~~~~~~
+#      13F table
+# ~~~~~~~~~~~~~~~~~~~~
 
 # Iterate through 13f datasets
 for dataset in os.listdir(own_inst_13f_dir):
@@ -170,6 +182,18 @@ for dataset in os.listdir(own_inst_13f_dir):
         own_inst_13f = pl.read_parquet(os.path.join(own_inst_13f_dir, dataset),
                                        use_pyarrow=True)
         
+        # Keep only positive positions
+        own_inst_13f = own_inst_13f.filter(pl.col('REPORTED_HOLDING')>0)
+        
+        # Adjusted holdings of 0 are considered null
+        own_inst_13f = own_inst_13f.with_columns(
+            pl.when(pl.col('ADJ_HOLDING') == 0)
+            .then(None)
+            .otherwise(pl.col('ADJ_HOLDING'))
+            .alias('ADJ_HOLDING')
+            )
+    
+        
         # Filter 
         inst_13f_ =  own_inst_13f.filter(
             pl.col('FSYM_ID').is_in(security_13f_set) &
@@ -179,8 +203,13 @@ for dataset in os.listdir(own_inst_13f_dir):
         inst_13f_ = inst_13f_.select(['FSYM_ID',
                                       'FACTSET_ENTITY_ID',
                                       'REPORT_DATE',
-                                      'ADJ_HOLDING',
-                                      'REPORTED_HOLDING'])
+                                      'ADJ_HOLDING'])
+        
+        # Drop null adjusted positions
+        inst_13f_ = inst_13f_.drop_nulls(['ADJ_HOLDING'])
+        # Rename
+        inst_13f_ = inst_13f_.rename({'ADJ_HOLDING' : 'ADJ_SHARES_HELD'})
+        
         
         # Define quarter 'date_q' in integer format based on 'REPORT_DATE'
         inst_13f_ = apply_quarter_scheme(inst_13f_, 'REPORT_DATE')
@@ -195,9 +224,12 @@ del own_inst_13f
 del inst_13f_
 
 
-# ------------------
+
+
+# ~~~~~~~~~~~~~~~~~~~~
 #   STAKES table
-# ------------------
+# ~~~~~~~~~~~~~~~~~~~~
+
 
 # Is there a most recent position in own_inst_stakes_detail within a 
 # quarter 'date_q'?
@@ -227,26 +259,32 @@ own_inst_stakes_ = (
     .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
     .agg(pl.all().sort_by('AS_OF_DATE').last())
     )
-              
+
+# Rename
+own_inst_stakes_ = own_inst_stakes_.rename({'POSITION' : 'ADJ_SHARES_HELD_STAKES'})
+
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   MERGE 13F WITH STAKES HOLDINGS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
               
 # Outer join 13F hodlings with stakes holdings on holder-security-quarter 
 # I opt for outer join instead of left join because there might be
 # holder-security positions that 13F do not capture.
+scheme_1 = scheme_1.rename({'ADJ_SHARES_HELD' : 'ADJ_SHARES_HELD_13F'})
+
 scheme_1_ = scheme_1.join(own_inst_stakes_, how='outer_coalesce',
                          on=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
               
-# Keep the position that is most recent over holder-security-quarter 
-# If the 'AS_OF_DATE' of stakes holdings is more recent than the 'REPORT_DATE'
-# of 13F holdings within 
-# a quarter for a holder-security combination, then the stakes 'POSITION' should 
-# be used, otherwise the 13F 'ADJ_HOLDING' should be used. 
+# Keep the position that is most recent over security-holder-quarter 
 scheme_1_final = ( 
                 scheme_1_
               .with_columns(
                pl.when(pl.col('AS_OF_DATE') > pl.col('REPORT_DATE'))
-               .then(pl.col('POSITION'))
-               .otherwise(pl.col('ADJ_HOLDING'))
+               .then(pl.col('ADJ_SHARES_HELD_STAKES'))
+               .otherwise(pl.col('ADJ_SHARES_HELD_13F'))
                .over(['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
                .alias('ADJ_SHARES_HELD')
                )
@@ -257,8 +295,8 @@ scheme_1_final = (
 scheme_1_final = (
     scheme_1_final
     .with_columns(
-    pl.when(pl.col('POSITION').is_not_null() & pl.col('ADJ_HOLDING').is_null())
-    .then(pl.col('POSITION'))
+    pl.when(pl.col('ADJ_SHARES_HELD_13F').is_null())
+    .then(pl.col('ADJ_SHARES_HELD_STAKES'))
     .otherwise(pl.col('ADJ_SHARES_HELD'))
     .alias('ADJ_SHARES_HELD')
     )
@@ -284,6 +322,8 @@ scheme_1_final = (
                     .drop_nulls()
                     )
 
+# Sort
+scheme_1_final = scheme_1_final.sort(by=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
 # Define the scheme
 scheme_1_final = scheme_1_final.with_columns(
@@ -293,7 +333,6 @@ scheme_1_final = scheme_1_final.with_columns(
 
 # Free memory
 del scheme_1_, scheme_1, own_inst_stakes_
-
 
 
 
