@@ -16,23 +16,35 @@ Gaspar, J. M., Massa, M., & Matos, P. (2005).
  Journal of Financial Economics, 76(1), 135-165.
 
 Input:
-   \Factset\factset_ownership_holdings_prices_equityShares.parquet 
+   \Factset\factset_adj_shares_holdings_security_level.parquet 
 
     
 Output:
-    ...\investors_short_long_term_gaspar2005.parquet
+    ...\short_and_long_term_investors_gaspar2005.parquet
 
 """
 
 import os
 import polars as pl
+import pandas as pd
+
+# ~~~~~~~~~~~~~~~~~~
+#    DIRECTORIES 
+# ~~~~~~~~~~~~~~~~~~
+
+# Current directory
+cd = r'C:\Users\FMCC\Desktop\Ioannis'
+
+# Parquet Factset tables
+factset_dir =  r'C:\FactSet_Downloadfiles\zips\parquet'
+#factset_dir = r'C:\Users\ropot\Desktop\Financial Data for Research\FactSet'
 
 
-wdir = r'C:\Users\ropot\Desktop\Python Scripts\Role of institutional investors on integration'
-os.chdir(wdir)
+print('Short- and long-term investors per Gaspar, Massa & Matos (2005) - START')
 
-# Set up environment
-import env
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   APPLY QUARTER SCHEME
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 def apply_quarter_scheme(df, date_col):
     
@@ -71,60 +83,71 @@ def apply_quarter_scheme(df, date_col):
 # ~~~~~~~~~~~~
 
 
-# Factset ownership holdings
-fh = pl.read_parquet(env.factset_dir('factset_ownership_holdings_prices_equityShares.parquet'))
+# Factset adjusted shares holdings
+fh = pl.read_parquet(os.path.join(cd, 'factset_adj_shares_holdings_security_level.parquet'))
 
 # Own sec prices
-own_sec_prices = pl.read_parquet(env.factset_dir('own_sec_prices_eq.parquet'))
+own_sec_prices = pl.read_parquet(os.path.join(factset_dir, 'own_sec_prices_eq.parquet'))
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#  KEEP THE MOST RECENT PRICE DATA WITHIN QUARTER
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  FORMAT OWN_SEC_PRICES TABLE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 
 # Define quarter date 'date_q'
 own_sec_prices = apply_quarter_scheme(own_sec_prices, 'PRICE_DATE')
 
 
 # Keep only the most recent 'price' observation within a quarter
-# for each security
-prices_q = ( 
+# for each security (data already sorted)
+own_sec_prices_q = ( 
     own_sec_prices
     .group_by(['FSYM_ID', 'date_q'])
-    .agg([pl.all().sort_by('PRICE_DATE').last()])
+    .agg(pl.all().sort_by('PRICE_DATE').last())
     )
 
 
-# Select only relevant columns
-prices_q = prices_q.select(['FSYM_ID', 
-                          'date_q', 
-                          'ADJ_PRICE'])
+# Adjusted prices only
+adj_prices_q = own_sec_prices_q.select(['FSYM_ID',
+                                         'date_q',
+                                         'ADJ_PRICE'])
+            
+
 
 # Sort
-prices_q = prices_q.sort(by=['FSYM_ID', 'date_q'])
+adj_prices_q = adj_prices_q.sort(by=['FSYM_ID', 'date_q'])
 
 
-#  Define price of previous quarter
-prices_q = prices_q.with_columns(
-    pl.col('ADJ_PRICE').shift().over('FSYM_ID').alias('ADJ_PRICE_LAG1')
-    )
+# Keep only positive adjusted prices
+adj_prices_q = adj_prices_q.filter(pl.col('ADJ_PRICE')>0)
 
 
 # Free memory 
 del own_sec_prices
 
 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   FULL HISTORY OF QUARTERS IN OWNERSHIP BUNDLE 
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# Last date 'end' is excluded.
+date_range = pd.date_range(start = pd.to_datetime('198912', format='%Y%m'), 
+                         end   = pd.to_datetime('202403', format='%Y%m'), 
+                         freq  = 'Q')
+
+date_range_int = [int(x.strftime('%Y%m')) for x in date_range]
+quarters_pl = pl.DataFrame({'date_q' :date_range_int }).cast(pl.Int32)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   PRICES WITH INTERMEDIATE QUARTER DATES FOR COMPLETE QUARTER HISTORY
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   MIN AND MAX DATES FOR EACH SECURITY-INSTITUTION PAIR
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-# Find the min and max quarter for each institution-security
+# Min and max price quarter dates for securities
 min_max_q = (
-    fh
-    .group_by(['FACTSET_ENTITY_ID', 'FSYM_ID'])
+    adj_prices_q
+    .group_by(['FSYM_ID'])
     .agg( 
     pl.col('date_q').min().alias('date_q_min'),
     pl.col('date_q').max().alias('date_q_max')
@@ -132,51 +155,124 @@ min_max_q = (
     )
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# KEEP PRICE DATA AND INTERMEDIATE QUARTER DATES FOR INSTITUTION-SECURITY PAIR
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+# Ownership securities 
+securities = adj_prices_q.select(['FSYM_ID']).unique()
 
-min_max_q_ = min_max_q.join(prices_q, how='left', on=['FSYM_ID'])
+# Cross join securities with all ownership possible quarter dates
+securities_q = securities.join(quarters_pl, how='cross')
 
-min_max_q_ = min_max_q_.filter(
+# Augment with very first and very last price data quarter
+securities_q = securities_q.join(min_max_q,
+                                how='left',
+                                on=['FSYM_ID']
+                                )
+
+# Keep only rows between minimum and maximum quarter of price data of security
+securities_q = securities_q.filter(
     (pl.col('date_q_min') <= pl.col('date_q') )
     & (pl.col('date_q') <= pl.col('date_q_max') )
     )
 
-min_max_q_ = min_max_q_.select(['FACTSET_ENTITY_ID',
-                                'FSYM_ID',
+# Left join with adjusted price data -> complete quarter price history
+securities_q = securities_q.join(adj_prices_q, 
+                                 how='left',
+                                 on=['FSYM_ID', 'date_q'])
+
+# Define the price of security lagged by one quarter
+securities_q = securities_q.with_columns(
+    pl.col('ADJ_PRICE').shift().over(['FSYM_ID']).alias('ADJ_PRICE_LAG1')
+    )
+
+
+# Keep only ordinary and preferred (+GDRADR) equity securities that have holdings
+securities_holdings = list(fh['FSYM_ID'].unique())
+securities_q_ = securities_q.filter(pl.col('FSYM_ID').is_in(securities_holdings))
+    
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   HOLDINGS WITH INTERMEDIATE QUARTER DATES FOR COMPLETE QUARTER HISTORY
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# Find the min and max quarter for each security-institution pair
+min_max_q = (
+    fh
+    .group_by(['FSYM_ID', 'FACTSET_ENTITY_ID'])
+    .agg( 
+    pl.col('date_q').min().alias('date_q_min'),
+    pl.col('date_q').max().alias('date_q_max')
+    )
+    )
+
+# Augment with full price history
+s = securities_q_.select(['FSYM_ID',
+                          'date_q',
+                          'ADJ_PRICE',
+                          'ADJ_PRICE_LAG1'])
+
+# Create positions table where security-institution-quarter pairs
+# are defined with complete quarter history if a position is missing:
+# Institution A owns security B in quarter 201003 and 201009 but not
+# 201006. I fill the security-institution-quarter pair history with
+# quarters such as 201006.
+positions = min_max_q.join(s,
+                            how='left', 
+                            on=['FSYM_ID'])
+
+# Keep only quarters that fall within 
+positions = positions.filter(
+    (pl.col('date_q_min') <= pl.col('date_q') )
+    & (pl.col('date_q') <= pl.col('date_q_max') )
+    )
+
+# Select necessary columns
+positions = positions.select(['FSYM_ID',
+                              'FACTSET_ENTITY_ID',
                                 'date_q',
                                 'ADJ_PRICE',
                                 'ADJ_PRICE_LAG1'])
 
-# Free memory
-del min_max_q, prices_q
+
+# Test operations
+a = positions.filter((pl.col('FSYM_ID') == 'K023Z4-S') & 
+                 (pl.col('FACTSET_ENTITY_ID') == '000HPH-E'))
+a.write_csv(os.path.join(cd, 'a_positions.csv'))
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   AUGMENT HOLDINGS WITH PRICE DATA AND INTERMEDIATE QUARTER DATES
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-
-# I LEFT merge the factset holdings because I want to 
-# augment it with the full history of intermediate quarter dates of 
-# securities that institutions hold. That will allow me to calculate 
-# aggregate purchases and sales using simply a lag operator.
-fh_prices = min_max_q_.join(fh.drop('ADJ_PRICE'), 
+# ---------------------
+# AUGMENT WITH HOLDINGS
+# ----------------------
+fh_prices = positions.join(fh, 
                            how='left', 
-                           on=['FACTSET_ENTITY_ID', 'FSYM_ID', 'date_q'])
+                           on=['FSYM_ID', 'FACTSET_ENTITY_ID', 'date_q'])
 
+# Test operations
+a = fh_prices.filter((pl.col('FSYM_ID') == 'K023Z4-S') & 
+                 (pl.col('FACTSET_ENTITY_ID') == '000HPH-E'))
+a.write_csv(os.path.join(cd, 'a_fh_prices.csv'))
+
+# Free memory
+del min_max_q, s, securities_q, positions
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#     FORMATTING THE MASTER DATASET
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Lag holdings by one quarter
 fh_prices = fh_prices.with_columns(
     pl.col('ADJ_SHARES_HELD')
     .shift()
-    .over(['FACTSET_ENTITY_ID', 'FSYM_ID'])
+    .over(['FSYM_ID', 'FACTSET_ENTITY_ID'])
     .alias('ADJ_SHARES_HELD_LAG1')
     )
 
-# Fill with 0 the current and lagged holdings of institution-security pairs 
+
+
+
+# Fill with 0 the current and lagged holdings of security-institution pairs 
 # in intermediate quarter dates when there is no holdings value
 fh_prices = fh_prices.with_columns(
     pl.col('ADJ_SHARES_HELD').fill_null(0),
@@ -185,8 +281,9 @@ fh_prices = fh_prices.with_columns(
 
 
 
+
 # Keep only the necessary columns for the calculation of churn rate
-fh_prices_ = fh_prices.select(['FACTSET_ENTITY_ID',
+fh_prices = fh_prices.select(['FACTSET_ENTITY_ID',
                                'FSYM_ID',
                                'date_q',
                                'ADJ_SHARES_HELD',
@@ -196,13 +293,13 @@ fh_prices_ = fh_prices.select(['FACTSET_ENTITY_ID',
 
 
 #  CHANGE IN HOLDINGS FROM QUARTER TO QUARTER
-fh_prices_ = fh_prices_.with_columns(
+fh_prices = fh_prices.with_columns(
     (pl.col('ADJ_SHARES_HELD') - pl.col('ADJ_SHARES_HELD_LAG1'))
     .alias('DeltaS')
     )
 
 # DEFINE BUY OR SELL 
-fh_prices_ = fh_prices_.with_columns(
+fh_prices = fh_prices.with_columns(
     pl.when(pl.col('DeltaS')>0)
     .then(1)
     .otherwise(0)
@@ -210,12 +307,25 @@ fh_prices_ = fh_prices_.with_columns(
     )
 
 
+# Test operations
+a = fh_prices.filter((pl.col('FSYM_ID') == 'K023Z4-S') & 
+                 (pl.col('FACTSET_ENTITY_ID') == '000HPH-E'))
+a.write_csv(os.path.join(cd, 'a_holdings.csv'))
+
+
+# KEEP ONLY QUARTERS THAT INSTITUTION ENTERS OR EXITS A POSITION
+fh_prices = fh_prices.filter(( pl.col('ADJ_SHARES_HELD') > 0 ) |
+                             ( pl.col('ADJ_SHARES_HELD') > 0 ))
+
+
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   AGGREGATE PURCHASE FOR INSTITUTION-QUARTER
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Keep only the buys 
-fh_prices_buy = fh_prices_.filter(pl.col('IS_BUY') == 1)
+fh_prices_buy = fh_prices.filter(pl.col('IS_BUY') == 1)
 
 # Aggregatte purchase
 agg_purchase = (
@@ -235,7 +345,7 @@ del fh_prices_buy
 
 
 # Keep only the sells
-fh_prices_sell = fh_prices_.filter(pl.col('IS_BUY') == 0)
+fh_prices_sell = fh_prices.filter(pl.col('IS_BUY') == 0)
 
 # Aggregatte sale
 agg_sale = (
@@ -249,17 +359,18 @@ agg_sale = (
 del fh_prices_sell
 
 
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   DENOMINATOR OF CHURN RATE VARIABLE
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# Holdings market cap
-hcap = fh_prices_.with_columns(
+#  Market cap holdings
+hcap = fh_prices.with_columns(
     (pl.col('ADJ_SHARES_HELD')*pl.col('ADJ_PRICE')).alias('HCAP'),
     (pl.col('ADJ_SHARES_HELD_LAG1')*pl.col('ADJ_PRICE_LAG1')).alias('HCAP_LAG1')    
     )
 
-# average of holdings market cap
+# Average of market cap holdings
 hcap = hcap.with_columns(
     ( 0.5*(pl.col('HCAP') + pl.col('HCAP_LAG1')) ).alias('HCAP_AVG')
     )
@@ -267,7 +378,7 @@ hcap = hcap.with_columns(
 # Select cols
 hcap = hcap.select(['FACTSET_ENTITY_ID', 'date_q', 'HCAP_AVG'])
 
-# average share position as denominator
+# Average share position as denominator
 denom = (
     hcap
     .group_by(['FACTSET_ENTITY_ID', 'date_q'])
@@ -281,9 +392,8 @@ del hcap
 #   CHURN RAGE FOR EACH INSTITUTION-QUARTER
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-
-
-# Use 'denom' dataset as reference
+# Use 'denom' dataset as reference (that is a choice that I believe makes no
+# difference in the outcome)
 churn = denom.join(agg_purchase, how='left', on=['FACTSET_ENTITY_ID', 'date_q'])
 churn = churn.join(agg_sale, how='left', on=['FACTSET_ENTITY_ID', 'date_q'])
 # Fill null values with 0
@@ -298,8 +408,7 @@ churn = churn.sort(by=['FACTSET_ENTITY_ID', 'date_q'])
 # Drop rows where average position is 0
 churn = churn.filter(pl.col('AVERAGE_POSITION')>0)
 
-
-# Sum value of aggregate purchase or sale
+# Sum of aggregate purchase or sale
 churn = churn.with_columns(
     (pl.col('PURCHASE') + pl.col('SALE'))
     .alias('SUM_AGG')
@@ -340,7 +449,6 @@ churn_rate = (
     .select(['FACTSET_ENTITY_ID', 'date_q', 'CHURN_RATE_ROLL4Q'])
     .drop_nulls()
     )
-
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -386,7 +494,7 @@ term = term.with_columns(
     )
 
 
-# ~~~~~~~~~~~~~~~~~~~~~~
+# ~~~~~~~~~~~~~~~~~
 #      SAVE 
 # ~~~~~~~~~~~~~~~~~~
 
@@ -399,11 +507,22 @@ term_ = (
     )
 
 
-term_.write_parquet(env.investors_integration_dir('investors_short_long_term_gaspar2005.parquet'))
+term_.write_parquet(os.path.join(cd, 'short_and_long_term_investors_gaspar2005.parquet'))
+
+print('Short- and long-term investors per Gaspar, Massa & Matos (2005) - END')
 
 
+# Sanity checks 
 
+# Number of institutions per category through quarters
+num_inst = term_.drop('FACTET_ENTITY_ID').group_by('date_q').sum().sort('date_q')
 
+num_inst.to_pandas().set_index('date_q').plot()
+
+# Average churn rate through the years
+b = term.group_by('date_q').agg(pl.col('CHURN_RATE_ROLL4Q').mean()).sort(by='date_q')
+
+b.to_pandas().set_index('date_q').plot()
 
 
 

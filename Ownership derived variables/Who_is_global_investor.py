@@ -45,7 +45,7 @@ Input:
    ...\iso_region_match.csv
     
 Output:
-    ...\investors_type.parquet
+    ...\global_and_local_investors.parquet
 
 """
 
