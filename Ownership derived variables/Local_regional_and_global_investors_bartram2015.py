@@ -1,5 +1,5 @@
 r"""
-Who is a global investor?
+Local, regional and global investors per Bartram et al. (2015)
 
 
 I use the definition of Bartram et al. (2015) to define global investors but 
@@ -46,6 +46,7 @@ Input:
     
 Output:
     ...\global_and_local_investors.parquet
+    
 
 """
 
@@ -59,18 +60,20 @@ import pandas as pd
 #  DIRECTORIES
 # ~~~~~~~~~~~~~~
 
-
+r"""
 # Current directory
 cd = r'C:\Users\FMCC\Desktop\Ioannis'
 
+
 # Parquet Factset tables
 factset_dir =  r'C:\FactSet_Downloadfiles\zips\parquet'
+"""
 
-# Set up environment
-#import env
+# Factset directory
+cd = r'C:\Users\ropot\Desktop\Financial Data for Research\FactSet'
 
 
-print('Who is a global investor? - START \n')
+print('Local, regional and global investors - START \n')
 
 
 # ~~~~~~~~~~~~~~~~~
@@ -96,7 +99,7 @@ iso_region = pl.read_csv(os.path.join(cd, 'iso_region_match.csv'))
 
 
 
-# Augment with the ISO country of the company/entity
+# Augment holdings dataset with the ISO country of the company/entity
 iso_entity = ( 
     own_sec_uni
     .select(['FACTSET_ENTITY_ID', 'ISO_COUNTRY_ENTITY'])
@@ -110,7 +113,12 @@ fh = fh.join(iso_entity, how='left', on = ['FACTSET_ENTITY_ID_FROM_FSYM_ID'])
 # Make sure that there are no null values
 fh_ = fh.drop_nulls()
 
+# Free memory
+del fh
+
 # Select only the necessary columns
+# Institution-Country that a company that institutions holds belongs to
+# - quarter - market capitalization of holdings
 fh_ = fh_.select(['FACTSET_ENTITY_ID',
                  'ISO_COUNTRY_ENTITY',  
                   'date_q',
@@ -205,7 +213,7 @@ fh_country_aug = fh_country_aug.join(min_max_q,
 fh_country_aug = fh_country_aug.filter(
                   (pl.col('date_q_min') <= pl.col('date_q'))
                  & (pl.col('date_q') <= pl.col('date_q_max'))
-    )
+                 )
 
 fh_country_aug = fh_country_aug.select(['FACTSET_ENTITY_ID',
                                         'ISO_COUNTRY',
@@ -239,7 +247,7 @@ fh_country_perc = fh_country_mcap.with_columns(
                   .over(['FACTSET_ENTITY_ID', 'date_q'])
                   )
                   ).alias('MCAP_HELD_PERC')
-                  
+          
     )
 
 # Define lagged mcap % holdings up to num_quarters quarters
@@ -276,17 +284,32 @@ fh_country_perc = fh_country_perc.select(['FACTSET_ENTITY_ID',
 fh_country_perc = fh_country_perc.drop_nulls()
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   PICK THE MAXIMUM AVERAGE MCAP % HOLDINGS 
+#   PICK THE MAXIMUM AVERAGE MCAP % HOLDINGS AND THE COUNTRY
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
 
+
+# Drop nan rows
+fh_country_perc = fh_country_perc.filter(pl.col('MCAP_HELD_PERC_ROLL4Q').is_not_nan())
+
+# Use sorting to positition the maximum value at the bottom of each
+# institution-quarter pair
+fh_country_perc = ( 
+    fh_country_perc
+    .sort(['FACTSET_ENTITY_ID', 'date_q', 'MCAP_HELD_PERC_ROLL4Q'])
+    )
+
+# Isolate the last row 
 fh_country_perc_max = (
     fh_country_perc
     .group_by(['FACTSET_ENTITY_ID', 'date_q'])
-    .agg(pl.col('MCAP_HELD_PERC_ROLL4Q').max().alias('MCAP_COUNTRY_MAX'))
-    .drop_nulls()
+    .agg(pl.all().last())
     )
 
-# Also drop nans
+fh_country_perc_max = fh_country_perc_max.rename({'MCAP_HELD_PERC_ROLL4Q':
+                                                  'MCAP_COUNTRY_MAX'})
+
+
+# Also drop nans (unnecessary)
 fh_country_perc_max = fh_country_perc_max.filter(pl.col('MCAP_COUNTRY_MAX').is_not_nan())
 
 # ~~~~~~~~~~~~~~~~~~~~~~~
@@ -301,23 +324,28 @@ fh_country_perc_max = fh_country_perc_max.with_columns(
     .alias('IS_LOCAL_INVESTOR')
     )
 
-local_investors = fh_country_perc_max.select(['FACTSET_ENTITY_ID', 
-                                              'date_q',
-                                              'IS_LOCAL_INVESTOR'])
-    
 
+# Keep necessary columns
+local_investors = (
+    fh_country_perc_max
+    .select(['FACTSET_ENTITY_ID', 'date_q', 'IS_LOCAL_INVESTOR', 'ISO_COUNTRY'])
+    .rename({'ISO_COUNTRY' : 'COUNTRY_MAX'})
+    )
+
+
+# ---------------------------
 #  MERGE WITH MASTER DATASET
+# ---------------------------
 investors_type = investors_type.join(local_investors, 
                                      how='left',
                                      on=['FACTSET_ENTITY_ID', 'date_q'])
 
 
 
+
 # Free memory
 del local_investors, fh_country_perc_max, fh_country_perc, fh_country_mcap
 del fh_country_aug, min_max_q, fh_country
-
-
 
 
 
@@ -462,17 +490,31 @@ fh_region_perc = fh_region_perc.drop_nulls()
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   PICK THE MAXIMUM AVERAGE MCAP % HOLDINGS 
+#   PICK THE MAXIMUM AVERAGE MCAP % HOLDINGS AND REGION
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
 
+# Drop nan rows
+fh_region_perc = fh_region_perc.filter(pl.col('MCAP_HELD_PERC_ROLL4Q').is_not_nan())
+
+# Use sorting to positition the maximum value at the bottom of each
+# institution-quarter pair
+fh_region_perc = ( 
+    fh_region_perc
+    .sort(['FACTSET_ENTITY_ID', 'date_q', 'MCAP_HELD_PERC_ROLL4Q'])
+    )
+
+# Isolate the last row 
 fh_region_perc_max = (
     fh_region_perc
     .group_by(['FACTSET_ENTITY_ID', 'date_q'])
-    .agg(pl.col('MCAP_HELD_PERC_ROLL4Q').max().alias('MCAP_REGION_MAX'))
-    .drop_nulls()
+    .agg(pl.all().last())
     )
 
-# Also drop nans
+fh_region_perc_max = fh_region_perc_max.rename({'MCAP_HELD_PERC_ROLL4Q':
+                                                  'MCAP_REGION_MAX'})
+
+
+# Also drop nans (unnecessary)
 fh_region_perc_max = fh_region_perc_max.filter(pl.col('MCAP_REGION_MAX').is_not_nan())
 
 
@@ -488,15 +530,22 @@ fh_region_perc_max = fh_region_perc_max.with_columns(
     .alias('IS_REGIONAL_INVESTOR')
     )
 
-regional_investors = fh_region_perc_max.select(['FACTSET_ENTITY_ID',
-                                                'date_q', 
-                                                'IS_REGIONAL_INVESTOR'])
+# Isolate the necessayr columns
+regional_investors = (
+                fh_region_perc_max
+                .select(['FACTSET_ENTITY_ID','date_q', 'IS_REGIONAL_INVESTOR', 'REGION'])
+                .rename({'REGION' : 'REGION_MAX'})
+                )
+                
     
-
+# ---------------------------
 #  MERGE WITH MASTER DATASET
+# ---------------------------
 investors_type = investors_type.join(regional_investors, 
                                      how='left',
                                      on=['FACTSET_ENTITY_ID', 'date_q'])
+
+
 
  
 
@@ -515,7 +564,7 @@ del fh_region_aug, min_max_q, fh_region
 # //////////////////////////////////////////////////////////////////////
 
 
-# Define global investors
+# If investor is not local or regional, then it is global
 investors_type = investors_type.with_columns(
     pl.when( (pl.col('IS_LOCAL_INVESTOR') == 0) 
             & (pl.col('IS_REGIONAL_INVESTOR') == 0))
@@ -523,7 +572,6 @@ investors_type = investors_type.with_columns(
     .otherwise(0)
     .alias('IS_GLOBAL_INVESTOR')
     )
-
 
 
 
@@ -584,7 +632,10 @@ investors_type = investors_type.with_columns(
 investors_type.write_parquet(os.path.join(cd, 'investors_type.parquet'))
 
 
-print('Who is a global investor? - END \n')
+print('Local, regional and global investors - END \n')
+
+
+
 
 # Sanity checks 
 
