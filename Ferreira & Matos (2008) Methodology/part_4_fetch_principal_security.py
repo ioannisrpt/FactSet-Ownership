@@ -77,18 +77,19 @@ sym_ticker_region = pl.read_parquet(os.path.join(factset_dir, 'sym_ticker_region
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # Companies/entities found in holdings
-companies = list(holdingsall.select(['COMPANY_ID']).unique()['COMPANY_ID'])
+own_companies = list(holdingsall.select(['COMPANY_ID']).unique()['COMPANY_ID'])
 
 # Only companies found in holdings
-own_sec_entity_ = own_sec_entity.filter(pl.col('FACTSET_ENTITY_ID').is_in(companies))
+#own_sec_entity_ = own_sec_entity.filter(pl.col('FACTSET_ENTITY_ID').is_in(companies))
 
 # principal_security TABLE 
-principal_security = sym_coverage.join(own_sec_entity_,
+principal_security = sym_coverage.join(own_sec_entity,
                                        how='left',
                                        on=['FSYM_ID'])
 principal_security = ( 
     principal_security
     .drop_nulls(['FACTSET_ENTITY_ID'])
+    .filter(pl.col('FACTSET_ENTITY_ID').is_in(own_companies))
     .filter(pl.col('FSYM_ID') == pl.col('FSYM_PRIMARY_EQUITY_ID'))
     .sort(by=['FACTSET_ENTITY_ID'])
     )
@@ -96,22 +97,27 @@ principal_security = (
 principal_security = principal_security.unique(['FACTSET_ENTITY_ID'])
 
 # Companies found in principal_security
-companies_principal_security = list(principal_security.select(['FACTSET_ENTITY_ID']).unique()['FACTSET_ENTITY_ID'])
+companies_in_principal_security = ( 
+    list(principal_security
+         .select(['FACTSET_ENTITY_ID'])
+         .unique()['FACTSET_ENTITY_ID'])
+    )
 
 # remaining_securities TABLE
-remaining_securities = sym_coverage.join(own_sec_entity_,
+remaining_securities = sym_coverage.join(own_sec_entity,
                                          how='left',
                                          on=['FSYM_ID'])
 
 remaining_securities = ( 
     remaining_securities
     .drop_nulls(['FACTSET_ENTITY_ID'])
-    .filter(~pl.col('FACTSET_ENTITY_ID').is_in(companies_principal_security))
+    .filter(pl.col('FACTSET_ENTITY_ID').is_in(own_companies))
+    .filter(~pl.col('FACTSET_ENTITY_ID').is_in(companies_in_principal_security))
     .filter(pl.col('FREF_SECURITY_TYPE').is_in(['SHARE', 'PREFEQ']))
     .sort(by=['FACTSET_ENTITY_ID', 'ACTIVE_FLAG', 'FREF_SECURITY_TYPE'])
     )
 
-remaining_securities = remaining_securities.unique(['FACTSET_ENTITY_ID'])
+remaining_securities = remaining_securities.unique(['FACTSET_ENTITY_ID'], keep='first')
 
 
 
@@ -150,6 +156,8 @@ entity_identifiers = entity_identifiers.rename({'FACTSET_ENTITY_ID' : 'COMPANY_I
 # Free memory
 del sym_cusip, sym_coverage, sym_isin, sym_xc_isin, sym_ticker_region
 
+
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #    AUGMENT HOLDINGS WITH PRIMARY SECURITY INFORMATION
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -165,3 +173,51 @@ entity_identifiers.write_parquet(os.path.join(cd, 'entity_identifiers.parquet'))
 
 holdingsall.write_parquet(os.path.join(cd, 'holdingsall_company_level_v2.parquet'))
 
+
+"""
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   SANITY CHECKS - WHAT IF EXCLUDE NO ISIN POSITIONS?
+# ~~~~~~~~~~~~~~~~~~~~~~
+
+
+# No ISIN positions
+holdingsall_ = ( 
+    holdingsall
+    .drop_nulls(['ISIN'])
+    .select(['FACTSET_ENTITY_ID',
+             'FSYM_ID',
+             'COMPANY_ID',
+             'date_q',
+             'MKTCAP_HELD'])
+    )
+
+
+
+# Sum of all institutional holdings 
+mcap_held = (
+    holdingsall_
+    .group_by('date_q')
+    .agg(pl.col('MKTCAP_HELD').sum())
+    .sort(by='date_q')
+    )
+
+# Sum of market cap of securitites being owned
+hmktcap = pl.read_parquet(os.path.join(cd, 'hmktcap.parquet'))
+mcap_sum = (
+    hmktcap
+    .group_by('date_q')
+    .agg(pl.col('MKTCAP_USD').sum())
+    .sort(by='date_q')
+    )
+
+# Inner merge
+io_agg = mcap_held.join(mcap_sum, on='date_q')
+
+io_agg = io_agg.with_columns(    
+    (pl.col('MKTCAP_HELD')/pl.col('MKTCAP_USD')).alias('IO')
+    )
+
+
+# Plot
+io_agg.select(['date_q', 'IO']).to_pandas().set_index('date_q').plot()
+"""

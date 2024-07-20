@@ -40,7 +40,7 @@ Notes:
     It is a tricky question with significant consequences in the calculation.
 
 Input:
-   \factset_mcap_holdings_company_level.parquet 
+   \holdingsall_company_level.parquet 
    \own_sec_universe.parquet
    ...\iso_region_match.csv
     
@@ -60,17 +60,16 @@ import pandas as pd
 #  DIRECTORIES
 # ~~~~~~~~~~~~~~
 
-r"""
+
 # Current directory
 cd = r'C:\Users\FMCC\Desktop\Ioannis'
 
 
 # Parquet Factset tables
 factset_dir =  r'C:\FactSet_Downloadfiles\zips\parquet'
-"""
 
 # Factset directory
-cd = r'C:\Users\ropot\Desktop\Financial Data for Research\FactSet'
+#cd = r'C:\Users\ropot\Desktop\Financial Data for Research\FactSet'
 
 
 print('Local, regional and global investors - START \n')
@@ -81,11 +80,14 @@ print('Local, regional and global investors - START \n')
 # ~~~~~~~~~~~~~~~~~
 
 # Onwership holdings at the company level
-fh = pl.read_parquet(os.path.join(cd, 'factset_mcap_holdings_company_level.parquet'))
+holdingsall = pl.read_parquet(os.path.join(cd, 'holdingsall_company_level.parquet'))
 
-# Universe of securities in the Ownership bunlde
-own_sec_uni = pl.read_parquet(os.path.join(cd, 'own_sec_universe.parquet'),
-                              use_pyarrow=True)
+# sym entity table : country origin of entities
+sym_entity =  pl.read_parquet(os.path.join(factset_dir, 'sym_entity.parquet'),
+                           use_pyarrow=True, 
+                           columns=['FACTSET_ENTITY_ID', 
+                                    'ISO_COUNTRY'])
+sym_entity = sym_entity.rename({'FACTSET_ENTITY_ID' : 'COMPANY_ID'})
 
 # ISO country and Region match
 iso_region = pl.read_csv(os.path.join(cd, 'iso_region_match.csv'))
@@ -97,35 +99,23 @@ iso_region = pl.read_csv(os.path.join(cd, 'iso_region_match.csv'))
 
 
 
-
-
-# Augment holdings dataset with the ISO country of the company/entity
-iso_entity = ( 
-    own_sec_uni
-    .select(['FACTSET_ENTITY_ID', 'ISO_COUNTRY_ENTITY'])
-    .unique(['FACTSET_ENTITY_ID', 'ISO_COUNTRY_ENTITY'])
-    .drop_nulls()
-    .rename({'FACTSET_ENTITY_ID' : 'FACTSET_ENTITY_ID_FROM_FSYM_ID'})
-    )
-
-fh = fh.join(iso_entity, how='left', on = ['FACTSET_ENTITY_ID_FROM_FSYM_ID'])
+# Augment holdings dataset with the ISO country of the company
+holdingsall = holdingsall.join(sym_entity, 
+                               how='left', 
+                               on = ['COMPANY_ID'])
 
 # Make sure that there are no null values
-fh_ = fh.drop_nulls()
+holdingsall = holdingsall.drop_nulls()
 
-# Free memory
-del fh
 
 # Select only the necessary columns
 # Institution-Country that a company that institutions holds belongs to
-# - quarter - market capitalization of holdings
-fh_ = fh_.select(['FACTSET_ENTITY_ID',
-                 'ISO_COUNTRY_ENTITY',  
+# a quarter 
+fh_ = holdingsall.select(['FACTSET_ENTITY_ID',
+                 'ISO_COUNTRY',  
                   'date_q',
-                  'MCAP_HELD'])
-
-fh_ = fh_.rename({'ISO_COUNTRY_ENTITY' : 'ISO_COUNTRY'})
-
+                  'MKTCAP_HELD'])
+fh_ = fh_.rename({'MKTCAP_HELD' : 'MCAP_HELD'})
 
 # Map iso country to a region
 fh_ = fh_.join(iso_region, how='left', on=['ISO_COUNTRY'])
